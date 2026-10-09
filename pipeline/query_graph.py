@@ -72,6 +72,22 @@ STOP_WORDS = {
     "all", "do", "does", "did", "have", "has", "had", "were", "was", "info", "details"
 }
 
+INFRA_DOMAIN_KEYWORDS = {
+    "dpwh", "project", "projects", "infrastructure", "infra", "contractor", "contractors",
+    "builder", "builders", "budget", "cost", "peso", "pesos", "allocated", "expenditure",
+    "cebu", "mandaue", "lapu", "talisay", "toledo", "bogo", "naga", "carcar",
+    "danao", "minglanilla", "consolacion", "cordova", "compostela", "liloan", "san fernando",
+    "balamban", "asturias", "tuburan", "pinamungajan", "aloguinsan", "barili", "dumanjug",
+    "ronda", "alcantara", "moalboal", "badian", "alegria", "malabuyoc", "ginatilan", "samboan",
+    "santander", "oslob", "boljoon", "alcoy", "dalaguete", "argao", "sibonga", "san remigio",
+    "medellin", "daanbantayan", "madridejos", "bantayan", "santa fe", "tabogon", "tabuelan",
+    "borbon", "sogod", "catmon", "carmen", "camotes", "pilar", "poro", "san francisco",
+    "tudela", "road", "roads", "highway", "bridge", "bridges", "flyover", "drainage",
+    "flood", "river", "seawall", "building", "hall", "school", "slope", "deo", "status",
+    "civil", "works", "engineering", "asphalt", "concrete", "paving", "rehabilitation"
+}
+
+
 # ==========================================================
 # 1. Instant Neo4j Graph Queries (< 50ms)
 # ==========================================================
@@ -738,7 +754,25 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
                 return answer_text, graph_context
 
         else:
-            # General Question - compact facts
+            if not matched_records and not last_context:
+                q_lower = question.lower()
+                q_words = set(re.findall(r'[a-zA-Z0-9]+', q_lower))
+                is_domain_query = bool(q_words & INFRA_DOMAIN_KEYWORDS)
+
+                if not is_domain_query:
+                    print("\n⚠️ Out of Scope: Query not related to DPWH Cebu Infrastructure.")
+                    print("💡 This assistant is strictly restricted to DPWH Cebu infrastructure projects, contractors, budgets, and locations.")
+                    print("   Example queries:")
+                    print("   • 'Any projects in Bogo?'")
+                    print("   • 'Who is the top contractor in Cebu?'")
+                    print("   • 'Tell me about project 24HH0043'")
+                    return "", ""
+                else:
+                    print(f"\n⚠️ No records found in the DPWH Cebu database matching '{search_query}'.")
+                    print("💡 Try searching by City/Municipality (e.g., 'Toledo', 'Mandaue') or Project ID (e.g., '24HH0043').")
+                    return "", ""
+
+            # General Question with matched graph facts or ongoing context
             if matched_records:
                 lines = []
                 for r in matched_records[:3]:
@@ -752,10 +786,8 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
                     for rel in (r.get("relations") or [])[:2]:
                         if rel.get("desc"): lines.append(f"Fact: {clean_location(rel['desc'])}")
                 graph_context = "\n".join(lines)
-            elif last_context:
-                graph_context = last_context[:500]
             else:
-                graph_context = "No specific facts found in knowledge graph for this term."
+                graph_context = last_context[:500]
 
             if mode == "instant":
                 print("💡 Instant Mode: Showing matching database entities above.")
@@ -767,12 +799,14 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
                 return "", graph_context
 
             system_prompt = (
-                "You are an expert DPWH infrastructure assistant in Cebu, Philippines.\n"
+                "You are an expert DPWH civil engineering assistant dedicated exclusively to Cebu, Philippines.\n"
                 "Answer accurately using ONLY the provided Knowledge Graph Context and prior conversation history.\n\n"
-                "CRITICAL RULES:\n"
-                "1. Distinguish roles: The Contractor is the private builder. The Implementing Office is the DPWH agency.\n"
-                "2. Be concise: answer in 1 to 2 complete, well-formed sentences.\n"
-                "3. Never say 'Barangay Unspecified'."
+                "CRITICAL BOUNDARIES:\n"
+                "1. STRICT DOMAIN LOCK: You must decline any questions unrelated to DPWH civil engineering or Cebu infrastructure (such as computer programming, coding, cooking, general trivia) in one sentence: 'I am restricted to answering questions regarding DPWH Cebu infrastructure projects and data.'\n"
+                "2. STRICT GROUNDING: State facts ONLY from the Knowledge Graph Context. Never invent projects, contractors, or figures.\n"
+                "3. Distinguish roles: The Contractor is the private builder. The Implementing Office is the DPWH agency.\n"
+                "4. Be concise: answer in 1 to 2 complete, well-formed sentences.\n"
+                "5. Never say 'Barangay Unspecified'."
             )
             print(f"\n================ 🤖 GROUNDED ANSWER ({LLM_MODEL}) ================")
             messages = [{"role": "system", "content": system_prompt}]
