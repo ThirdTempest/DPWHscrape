@@ -14,17 +14,42 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+_supabase = None
+_driver = None
 
-if not all([SUPABASE_URL, SUPABASE_SERVICE_KEY, NEO4J_URI, NEO4J_PASSWORD]):
-    raise ValueError("Missing required environment variables in .env")
+def get_clients():
+    """Lazily initialize Supabase client and Neo4j driver with friendly error handling."""
+    global _supabase, _driver
+    if _supabase is None or _driver is None:
+        supa_url = os.getenv("SUPABASE_URL")
+        supa_key = os.getenv("SUPABASE_SERVICE_KEY")
+        neo4j_uri = os.getenv("NEO4J_URI")
+        neo4j_user = os.getenv("NEO4J_USERNAME", "neo4j")
+        neo4j_pass = os.getenv("NEO4J_PASSWORD")
 
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+        if not all([supa_url, supa_key, neo4j_uri, neo4j_pass]):
+            print("\n" + "=" * 68)
+            print("❌ CONFIGURATION ERROR: Missing Sync Credentials")
+            print("=" * 68)
+            print("Syncing Supabase projects to Neo4j requires both database connections:")
+            print("\n👉 Please check your .env file:")
+            if not supa_url or not supa_key:
+                print("  • SUPABASE_URL / SUPABASE_SERVICE_KEY are missing (https://supabase.com)")
+            if not neo4j_uri or not neo4j_pass:
+                print("  • NEO4J_URI / NEO4J_PASSWORD are missing (https://neo4j.com/aura)")
+            print("=" * 68 + "\n")
+            return None, None
+
+        _supabase = create_client(supa_url, supa_key)
+        _driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_pass))
+    return _supabase, _driver
+
+def close_driver():
+    global _driver
+    if _driver is not None:
+        _driver.close()
+        _driver = None
+
 
 def extract_field(pattern: str, text: str) -> str:
     m = re.search(pattern, text)
@@ -100,6 +125,10 @@ def init_neo4j_schema(session):
             pass
 
 def sync_projects_to_neo4j(reset: bool = False, limit: int = None):
+    supabase, driver = get_clients()
+    if not supabase or not driver:
+        return
+
     start_time = time.time()
 
     # 1. Fetch from Supabase with pagination
@@ -242,4 +271,5 @@ def sync_projects_to_neo4j(reset: bool = False, limit: int = None):
 if __name__ == "__main__":
     reset_flag = "--reset" in sys.argv
     sync_projects_to_neo4j(reset=reset_flag)
-    driver.close()
+    close_driver()
+

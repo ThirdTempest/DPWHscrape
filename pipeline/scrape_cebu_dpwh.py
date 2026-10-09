@@ -21,11 +21,31 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-if not all([APIFY_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_KEY]):
-    raise ValueError("Missing required environment variables in .env")
+def get_clients():
+    """Lazily initialize Apify and Supabase clients with friendly error handling."""
+    apify_token = os.getenv("APIFY_TOKEN")
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
 
-apify = ApifyClient(APIFY_TOKEN)
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    if not all([apify_token, supabase_url, supabase_key]):
+        print("\n" + "=" * 68)
+        print("❌ CONFIGURATION ERROR: Missing Scraper Credentials")
+        print("=" * 68)
+        print("Scraping DPWH projects requires Apify and Supabase credentials:")
+        print("\n👉 Please check your .env file:")
+        if not apify_token:
+            print("  • APIFY_TOKEN is missing (get free key at https://console.apify.com)")
+        if not supabase_url or not supabase_key:
+            print("  • SUPABASE_URL / SUPABASE_SERVICE_KEY are missing (https://supabase.com)")
+        print("\n💡 Tip: If you only want to query the existing knowledge graph,")
+        print("   run: python main.py (no scraping keys required!)")
+        print("=" * 68 + "\n")
+        return None, None
+
+    apify = ApifyClient(apify_token)
+    supabase = create_client(supabase_url, supabase_key)
+    return apify, supabase
+
 
 CEBU_DEO_MAP = {
     "Cebu City DEO": "Cebu City (North & South Districts)",
@@ -116,6 +136,11 @@ def main():
     parser.add_argument("--limit", "-l", type=int, default=None, help="Optional max project limit (e.g. 1000)")
     parser.add_argument("--no-sync", action="store_true", help="Skip automatic sync to Neo4j")
     args = parser.parse_args()
+
+    # Check credentials before starting
+    apify, supabase = get_clients()
+    if not apify or not supabase:
+        sys.exit(1)
 
     # 1. Fetch from BetterGov Meilisearch API
     projects = fetch_all_cebu_dpwh_projects(max_projects=args.limit)

@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import asyncio
+import time
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 import httpx
@@ -14,16 +15,62 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
 
 load_dotenv()
 
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
 
-if not all([NEO4J_URI, NEO4J_PASSWORD]):
-    raise ValueError("Missing Neo4j environment variables in .env")
+_driver = None
 
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+def print_neo4j_missing_error():
+    print("\n" + "=" * 68)
+    print("❌ CONFIGURATION ERROR: Missing Neo4j Database Credentials")
+    print("=" * 68)
+    print("The DPWH Cebu Knowledge Graph requires a Neo4j connection.")
+    print("\n👉 Quick Setup Steps:")
+    print("  1. Copy the template environment file:")
+    print("     copy .env.example .env     (Windows)")
+    print("     cp .env.example .env       (Mac/Linux)")
+    print("\n  2. Open .env and add your Neo4j credentials:")
+    print('     NEO4J_URI="neo4j+s://your-instance.databases.neo4j.io"')
+    print('     NEO4J_USERNAME="neo4j"')
+    print('     NEO4J_PASSWORD="your-password"')
+    print("\n     • Free Neo4j Aura cloud database: https://neo4j.com/cloud/platform/aura-graph-database/")
+    print("     • Or local Neo4j Desktop / Docker: bolt://localhost:7687")
+    print("\n💡 Note: All queries, project lookups, and instant search work")
+    print("   purely with Neo4j — No AI API or local AI is required!")
+    print("=" * 68 + "\n")
+
+def get_driver():
+    """Lazily initialize Neo4j driver with custom error reporting."""
+    global _driver
+    if _driver is None:
+        uri = os.getenv("NEO4J_URI")
+        user = os.getenv("NEO4J_USERNAME", "neo4j")
+        pwd = os.getenv("NEO4J_PASSWORD")
+        if not all([uri, pwd]):
+            print_neo4j_missing_error()
+            sys.exit(1)
+        _driver = GraphDatabase.driver(uri, auth=(user, pwd))
+    return _driver
+
+class DriverProxy:
+    def session(self, **kwargs):
+        return get_driver().session(**kwargs)
+    def close(self):
+        global _driver
+        if _driver is not None:
+            _driver.close()
+            _driver = None
+
+driver = DriverProxy()
+
+
+STOP_WORDS = {
+    "what", "are", "is", "the", "for", "in", "of", "and", "a", "an", "who", "which",
+    "where", "how", "tell", "me", "about", "project", "projects", "located", "there",
+    "any", "give", "list", "show", "it", "that", "this", "them", "some", "many",
+    "much", "count", "number", "total", "sum", "can", "you", "please", "find",
+    "all", "do", "does", "did", "have", "has", "had", "were", "was", "info", "details"
+}
 
 # ==========================================================
 # 1. Instant Neo4j Graph Queries (< 50ms)
@@ -83,13 +130,52 @@ def sanitize_search_query(query: str) -> str:
     q = re.sub(r'lapu[- ]*lapu', 'Lapu', query, flags=re.IGNORECASE)
     q = re.sub(r'cebu[- ]*city', 'Cebu City', q, flags=re.IGNORECASE)
     q = re.sub(r'[^a-zA-Z0-9\s]', ' ', q)
-    stop_words = {
-        "what", "are", "is", "the", "for", "in", "of", "and", "a", "an", "who", "which",
-        "where", "how", "tell", "me", "about", "project", "projects", "located", "there",
-        "any", "give", "list", "show", "it", "that", "this", "them", "some"
-    }
-    words = [w for w in q.split() if len(w) > 2 and w.lower() not in stop_words]
+    words = [w for w in q.split() if len(w) > 2 and w.lower() not in STOP_WORDS]
     return " ".join(words) if words else q.strip()
+
+def search_projects_by_location(loc_name: str, limit: int = 15) -> tuple[list[dict], int, float]:
+    """Retrieve all projects matching a municipality, city, or barangay location."""
+    clean_loc = sanitize_search_query(loc_name).strip()
+    if not clean_loc or len(clean_loc) < 3:
+        return [], 0, 0.0
+
+    cypher_count = """
+    MATCH (p:Project)-[:LOCATED_IN]->(loc:Location)
+    WHERE toLower(loc.name) CONTAINS toLower($loc)
+    RETURN count(DISTINCT p) AS cnt, sum(p.budget_numeric) AS total_budget
+    """
+    cypher_samples = """
+    MATCH (p:Project)-[:LOCATED_IN]->(loc:Location)
+    WHERE toLower(loc.name) CONTAINS toLower($loc)
+    WITH DISTINCT p, loc
+    ORDER BY p.budget_numeric DESC
+    LIMIT $limit
+    OPTIONAL MATCH (p)-[:CONTRACTED_TO]->(c:Contractor)
+    RETURN p.project_id AS entity,
+           ['Project'] AS labels,
+           p.description AS description,
+           p.budget_raw AS budget,
+           p.budget_numeric AS budget_num,
+           p.status AS status,
+           p.url AS url,
+           1.0 AS score,
+           [
+               {rel: 'LOCATED_IN', target: loc.name, desc: loc.name},
+               {rel: 'CONTRACTED_TO', target: coalesce(c.name, 'N/A'), desc: coalesce(c.name, 'N/A')}
+           ] AS relations
+    """
+    with driver.session() as s:
+        try:
+            cnt_row = s.run(cypher_count, loc=clean_loc).single()
+            if not cnt_row or cnt_row["cnt"] == 0:
+                return [], 0, 0.0
+            total_cnt = cnt_row["cnt"]
+            total_b = cnt_row["total_budget"] or 0.0
+
+            samples = s.run(cypher_samples, loc=clean_loc, limit=limit).data()
+            return samples, total_cnt, total_b
+        except Exception:
+            return [], 0, 0.0
 
 def search_graph_fts(query: str, limit: int = 5) -> list[dict]:
     """Full-text search across projects, contractors, and locations with early LIMIT for sub-100ms response."""
@@ -249,21 +335,22 @@ def print_matched_projects_list(records: list[dict], title: str = "MATCHED PROJE
         print()
     print("=" * 62)
 
-def print_instant_insights(records: list[dict]):
-    """Compute sub-millisecond aggregate highlights directly from matched graph records."""
-    total = len(records)
-    tot_budget = 0.0
+def print_instant_insights(records: list[dict], total_count: int | None = None, total_budget: float | None = None) -> dict:
+    """Compute sub-millisecond aggregate highlights directly from matched graph records or known database totals."""
+    total = total_count if total_count is not None else len(records)
+    tot_budget = total_budget if total_budget is not None else 0.0
     categories = []
     contractors = []
     
     for r in records:
-        b_raw = r.get('budget', '')
-        nums = re.findall(r'[\d,]+(?:\.\d+)?', str(b_raw))
-        if nums:
-            try:
-                tot_budget += float(nums[0].replace(',', ''))
-            except Exception:
-                pass
+        if total_budget is None:
+            b_raw = r.get('budget', '')
+            nums = re.findall(r'[\d,]+(?:\.\d+)?', str(b_raw))
+            if nums:
+                try:
+                    tot_budget += float(nums[0].replace(',', ''))
+                except Exception:
+                    pass
         
         desc = str(r.get('description', '')).upper()
         if 'WATER' in desc: categories.append('Water Supply & Drainage')
@@ -281,14 +368,22 @@ def print_instant_insights(records: list[dict]):
 
     cat_str = ', '.join(list(dict.fromkeys(categories))[:3]) or 'Infrastructure Works'
     top_c = ', '.join(list(dict.fromkeys(contractors))[:2])
+    budget_fmt = f"₱{tot_budget:,.2f}" if tot_budget > 0 else "Budget Under Verification"
     
     print("📊 Instant Graph Insights (<1ms):")
-    budget_fmt = f"₱{tot_budget:,.2f}" if tot_budget > 0 else "Budget Under Verification"
     print(f"   • Total Projects:  {total} | Total Allocated: {budget_fmt}")
     print(f"   • Primary Sectors: {cat_str}")
     if top_c:
         print(f"   • Key Builders:    {top_c}")
     print("-" * 62)
+
+    return {
+        "total_count": total,
+        "total_budget": tot_budget,
+        "total_budget_fmt": budget_fmt,
+        "sectors": cat_str,
+        "key_contractors": top_c
+    }
 
 def print_fts_results(results: list[dict]):
     if not results:
@@ -321,8 +416,49 @@ def print_fts_results(results: list[dict]):
 # 3. Grounded Streaming QA via Local Ollama
 # ==========================================================
 
+def ensure_ollama_running() -> bool:
+    """Checks if Ollama or local LLM endpoint is reachable; auto-starts Ollama in background if offline."""
+    import urllib.request
+    import subprocess
+    import shutil
+
+    try:
+        with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=0.8) as res:
+            if res.status == 200:
+                return True
+    except Exception:
+        pass
+
+    # If ollama executable is not installed on this system, don't attempt to start it
+    if not shutil.which("ollama"):
+        return False
+
+    print("🔄 Local Ollama is offline. Starting Ollama automatically in background...")
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        subprocess.Popen(
+            ["ollama", "serve"],
+            creationflags=flags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False
+        )
+        for _ in range(10):
+            time.sleep(0.5)
+            try:
+                with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=0.8) as res:
+                    if res.status == 200:
+                        print("✅ Ollama started successfully.")
+                        return True
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"⚠️ Could not auto-start Ollama: {e}")
+    return False
+
+
 async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
-    """Stream from local Ollama with hardware-optimized CPU threading and context size."""
+    """Stream from local Ollama or OpenAI-compatible endpoint with real-time response timer."""
     url_native = "http://localhost:11434/api/chat"
     payload_native = {
         "model": LLM_MODEL,
@@ -337,6 +473,10 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
     }
     
     collected_chunks = []
+    start_time = time.perf_counter()
+    first_token_time = None
+    token_count = 0
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
             async with client.stream("POST", url_native, json=payload_native) as resp:
@@ -348,17 +488,25 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
                         d = json.loads(line)
                         chunk = d.get("message", {}).get("content", "")
                         if chunk:
+                            if first_token_time is None:
+                                first_token_time = time.perf_counter()
+                            token_count += 1
                             sys.stdout.write(chunk)
                             sys.stdout.flush()
                             collected_chunks.append(chunk)
                         if d.get("done"):
                             break
-                    print("\n" + "=" * 62)
+                    elapsed = time.perf_counter() - start_time
+                    ttft = (first_token_time - start_time) if first_token_time else elapsed
+                    gen_duration = elapsed - ttft
+                    speed_str = f" | ~{token_count / gen_duration:.1f} tok/s" if (token_count > 1 and gen_duration > 0.05) else ""
+                    print(f"\n⏱️ Response time: {elapsed:.2f}s (TTFT: {ttft:.2f}s{speed_str})")
+                    print("=" * 62)
                     return "".join(collected_chunks).strip()
     except Exception:
         pass
 
-    # Fallback to standard OpenAI-compatible endpoint
+    # Fallback to standard OpenAI-compatible endpoint (e.g. vLLM or local server)
     url_v1 = f"{LLM_BASE_URL}/chat/completions"
     payload_v1 = {
         "model": LLM_MODEL,
@@ -367,6 +515,10 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
         "max_tokens": max_tokens,
         "temperature": 0.1
     }
+    start_time_v1 = time.perf_counter()
+    first_token_time_v1 = None
+    token_count_v1 = 0
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
             async with client.stream("POST", url_v1, json=payload_v1) as resp:
@@ -376,15 +528,48 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
                         try:
                             d = json.loads(line[6:])
                             chunk = d["choices"][0]["delta"].get("content", "")
-                            sys.stdout.write(chunk)
-                            sys.stdout.flush()
-                            collected_chunks.append(chunk)
+                            if chunk:
+                                if first_token_time_v1 is None:
+                                    first_token_time_v1 = time.perf_counter()
+                                token_count_v1 += 1
+                                sys.stdout.write(chunk)
+                                sys.stdout.flush()
+                                collected_chunks.append(chunk)
                         except Exception:
                             pass
-        print("\n" + "=" * 62)
+        elapsed = time.perf_counter() - start_time_v1
+        ttft = (first_token_time_v1 - start_time_v1) if first_token_time_v1 else elapsed
+        gen_duration = elapsed - ttft
+        speed_str = f" | ~{token_count_v1 / gen_duration:.1f} tok/s" if (token_count_v1 > 1 and gen_duration > 0.05) else ""
+        print(f"\n⏱️ Response time: {elapsed:.2f}s (TTFT: {ttft:.2f}s{speed_str})")
+        print("=" * 62)
         return "".join(collected_chunks).strip()
     except Exception as e:
-        print(f"\n⚠️ Ollama generation error: {e}\n" + "=" * 62)
+        if "connection" in str(e).lower() and ensure_ollama_running():
+            print("🔄 Auto-started Ollama. Retrying request...")
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+                    async with client.stream("POST", url_v1, json=payload_v1) as resp:
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: ") and not line.endswith("[DONE]"):
+                                import json
+                                try:
+                                    d = json.loads(line[6:])
+                                    chunk = d["choices"][0]["delta"].get("content", "")
+                                    if chunk:
+                                        sys.stdout.write(chunk)
+                                        sys.stdout.flush()
+                                        collected_chunks.append(chunk)
+                                except Exception:
+                                    pass
+                print("\n" + "=" * 62)
+                return "".join(collected_chunks).strip()
+            except Exception:
+                pass
+        print(f"\n💡 Notice: Local AI summary is currently unavailable ({e.__class__.__name__}).")
+        print("   All verified facts and data from the Knowledge Graph are shown above.")
+        print(f"   👉 To enable AI summaries: install Ollama (https://ollama.com) and run: `ollama pull {LLM_MODEL}`")
+        print("=" * 62)
         return ""
 
 async def ask_llm_stream(question: str, history: list[dict] = None, last_context: str = "", mode: str = "ai") -> tuple[str, str]:
@@ -394,12 +579,7 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
 
     print("🔍 Fetching knowledge graph facts from Neo4j (<20ms)...")
 
-    stop_words = {
-        "what", "are", "is", "the", "for", "in", "of", "and", "a", "an", "who", "which",
-        "where", "how", "tell", "me", "about", "project", "projects", "located", "give", "list",
-        "it", "that", "this", "them", "they", "more", "details", "info", "there", "any"
-    }
-    terms = [w for w in re.findall(r'[A-Za-z0-9_]+', question) if w.lower() not in stop_words and len(w) > 2]
+    terms = [w for w in re.findall(r'[A-Za-z0-9_]+', question) if w.lower() not in STOP_WORDS and len(w) > 2]
     followup_cues = ["it", "that", "this", "more", "contractor", "budget", "status", "timeline", "who", "cost", "when", "details"]
     is_followup = bool(history) and (len(terms) == 0 or any(w in question.lower().split() for w in followup_cues))
 
@@ -431,6 +611,23 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
         # Uniform Single Project Card
         print_project_card(targeted_project)
         
+        graph_context = (
+            f"Project: DPWH Project {targeted_project['id']}\n"
+            f"Category: {targeted_project.get('category', 'Infrastructure')}\n"
+            f"Location: {clean_location(targeted_project.get('location'))}\n"
+            f"Scope Description: {clean_description(targeted_project.get('description'))}\n"
+            f"Status: {targeted_project.get('status', 'Completed')}"
+        )
+
+        if mode == "instant":
+            print("💡 Instant Mode: Project details loaded from Neo4j in <10ms. (Type '/ai' to enable summaries)")
+            return "", graph_context
+
+        if not ensure_ollama_running():
+            print(f"\n💡 Notice: Local AI ({LLM_MODEL}) is offline or not installed.")
+            print("   Complete project details from the Knowledge Graph are displayed above.")
+            return "", graph_context
+
         system_prompt = (
             "You are an expert DPWH civil engineering assistant in Cebu, Philippines.\n"
             "Provide a concise 1 to 2 sentence plain-English summary of what this project accomplishes.\n\n"
@@ -439,13 +636,6 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
             "2. Do NOT recite the raw budget figures, dates, contractor name, or office name (the project card already displays them).\n"
             "3. NEVER use the phrase 'Barangay Unspecified'.\n"
             "4. Always output complete, grammatically finished sentences ending with terminal punctuation (. or !). Never stop mid-sentence."
-        )
-        graph_context = (
-            f"Project: DPWH Project {targeted_project['id']}\n"
-            f"Category: {targeted_project.get('category', 'Infrastructure')}\n"
-            f"Location: {clean_location(targeted_project.get('location'))}\n"
-            f"Scope Description: {clean_description(targeted_project.get('description'))}\n"
-            f"Status: {targeted_project.get('status', 'Completed')}"
         )
         print(f"\n🤖 Grounded Engineering Summary ({LLM_MODEL}):")
         print("-" * 62)
@@ -457,48 +647,95 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
         return answer_text, graph_context
 
     else:
-        # Full-text search across graph
         search_query = " ".join(terms) if terms else question
-        matched_records = search_graph_fts(search_query, limit=12)
-        matched_projects = [
-            r for r in matched_records 
-            if "Project" in r.get("labels", []) or str(r.get("entity", "")).startswith("DPWH Project")
-        ]
+
+        # 3a. Check if this query corresponds to a location in the knowledge graph
+        loc_projects, loc_total_cnt, loc_total_budget = search_projects_by_location(search_query)
+
+        matched_records = []
+        if loc_projects:
+            matched_projects = loc_projects
+            total_in_db = loc_total_cnt
+            total_b_val = loc_total_budget
+            loc_label = search_query.title()
+            print_matched_projects_list(matched_projects, title=f"PROJECTS IN: {loc_label} ({total_in_db} Found in Graph | Showing Top {len(matched_projects)})")
+            insights = print_instant_insights(matched_projects, total_count=total_in_db, total_budget=total_b_val)
+        else:
+            # 3b. Fallback to full-text search across graph
+            matched_records = search_graph_fts(search_query, limit=25)
+            matched_projects = [
+                r for r in matched_records 
+                if "Project" in r.get("labels", []) or str(r.get("entity", "")).startswith("DPWH Project")
+            ]
+            if matched_projects:
+                loc_label = " ".join([w.title() for w in terms]) if terms else "Knowledge Graph"
+                print_matched_projects_list(matched_projects, title=f"PROJECTS FOUND: {loc_label} ({len(matched_projects)} Found)")
+                insights = print_instant_insights(matched_projects)
 
         if matched_projects:
-            loc_label = " ".join([w.title() for w in terms]) if terms else "Knowledge Graph"
-            print_matched_projects_list(matched_projects, title=f"PROJECTS FOUND: {loc_label}")
-            print_instant_insights(matched_projects)
-
             if mode == "instant":
                 print("💡 Instant Mode active. Type any Project ID (e.g. '25HN0012') or ask 'tell me more' for deep AI analysis.")
                 return "", ""
 
-            # Ultra-compact context for prompt evaluation: keeps TTFT under 1.5s
+            if not ensure_ollama_running():
+                print(f"💡 Notice: Local AI ({LLM_MODEL}) is offline. Graph results and instant metrics are displayed above.")
+                print(f"👉 To enable AI summaries: install Ollama (https://ollama.com) and run: `ollama pull {LLM_MODEL}`")
+                print("💡 Tip: Type any Project ID (e.g. '25HN0012') for full engineering details.")
+                return "", ""
+
+            # Compact context for prompt evaluation: keeps TTFT under 1.5s
             lines = []
-            for p in matched_projects[:4]:
+            for p in matched_projects[:5]:
                 pid = p['entity'].replace('DPWH Project ', '')
                 desc = clean_description(p.get('description'))
                 if len(desc) > 65:
                     desc = desc[:65] + "..."
                 b = p.get('budget', 'N/A')
                 lines.append(f"{pid}: {desc} ({b})")
-            graph_context = " | ".join(lines)
+            sample_lines = " | ".join(lines)
 
-            system_prompt = (
-                "You are an expert DPWH civil engineering assistant in Cebu, Philippines.\n"
-                "Summarize primary public works focus in 1 concise sentence. Do not repeat project IDs."
-            )
-            print(f"🤖 Grounded Civil Works Summary ({LLM_MODEL}):")
-            print("-" * 62)
+            is_count_query = any(w in question.lower() for w in ["how many", "count", "number of", "total project", "total count"])
 
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Projects in {loc_label}: {graph_context}\nQuestion: {question}"}
-            ]
-            answer_text = await stream_ollama(messages, max_tokens=45)
-            print("💡 Tip: Type any Project ID (e.g. '25HN0012') or ask 'tell me more about [ID]' for full engineering details.")
-            return answer_text, graph_context
+            if is_count_query:
+                system_prompt = (
+                    "You are an expert DPWH civil engineering assistant in Cebu, Philippines.\n"
+                    f"State directly in ONE complete sentence that there are {insights['total_count']} recorded DPWH projects in {loc_label} with a total allocated budget of {insights['total_budget_fmt']}."
+                )
+                print(f"🤖 Grounded Answer ({LLM_MODEL}):")
+                print("-" * 62)
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": question}
+                ]
+                answer_text = await stream_ollama(messages, max_tokens=65)
+                print("💡 Tip: Type any Project ID (e.g. '25HN0012') or ask 'tell me more about [ID]' for full engineering details.")
+                return answer_text, f"Projects in {loc_label}: {insights['total_count']} ({insights['total_budget_fmt']})"
+
+            else:
+                graph_context = (
+                    f"Location / Subject: {loc_label}\n"
+                    f"Total Recorded Projects in Database: {insights['total_count']}\n"
+                    f"Total Allocated Budget: {insights['total_budget_fmt']}\n"
+                    f"Primary Sectors: {insights['sectors']}\n"
+                    f"Key Contractors: {insights['key_contractors'] or 'Various'}\n"
+                    f"Sample Projects: {sample_lines}"
+                )
+
+                system_prompt = (
+                    "You are an expert DPWH civil engineering assistant in Cebu, Philippines.\n"
+                    "Summarize primary public works in 1 to 2 complete sentences based ONLY on the context. Do NOT list project numbers one by one.\n"
+                    "Never say 'Barangay Unspecified'."
+                )
+                print(f"🤖 Grounded Answer ({LLM_MODEL}):")
+                print("-" * 62)
+
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Knowledge Graph Context:\n{graph_context}\n\nUser Question: {question}"}
+                ]
+                answer_text = await stream_ollama(messages, max_tokens=90)
+                print("💡 Tip: Type any Project ID (e.g. '25HN0012') or ask 'tell me more about [ID]' for full engineering details.")
+                return answer_text, graph_context
 
         else:
             # General Question - compact facts
@@ -519,6 +756,15 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
                 graph_context = last_context[:500]
             else:
                 graph_context = "No specific facts found in knowledge graph for this term."
+
+            if mode == "instant":
+                print("💡 Instant Mode: Showing matching database entities above.")
+                return "", graph_context
+
+            if not ensure_ollama_running():
+                print(f"\n💡 Notice: Local AI ({LLM_MODEL}) is offline. Graph context is displayed above.")
+                print(f"👉 To enable AI answers: install Ollama (https://ollama.com) and run: `ollama pull {LLM_MODEL}`")
+                return "", graph_context
 
             system_prompt = (
                 "You are an expert DPWH infrastructure assistant in Cebu, Philippines.\n"
@@ -543,9 +789,17 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
 # ==========================================================
 
 def run_console():
+    has_ai = ensure_ollama_running()
+    current_mode = os.environ.get("DEFAULT_CONSOLE_MODE")
+    if not current_mode:
+        current_mode = "ai" if has_ai else "instant"
+
     print("\n" + "=" * 65)
     print(f"⚡ Neo4j Knowledge Graph Console (DPWH Cebu Infrastructure)")
-    print(f"Connected to Neo4j Aura + Local Ollama ({LLM_MODEL})")
+    if has_ai:
+        print(f"Connected to Neo4j Aura + Local Ollama ({LLM_MODEL})")
+    else:
+        print(f"Connected to Neo4j Aura (Instant Cypher Mode - No AI required)")
     print("=" * 65)
     print("Quick Commands:")
     print("  • Type any project ID (e.g. '24HH0043') for instant project card (<10ms)")
@@ -554,16 +808,17 @@ def run_console():
     print("  • Type '/top-budgets' to see the largest projects")
     print("  • Type '/summary' for dataset totals")
     print("  • Type '/instant' for sub-second database mode (skips LLM wait on searches)")
-    print("  • Type '/ai' for grounded AI summary mode (default)")
+    print("  • Type '/ai' for grounded AI summary mode")
     print("  • Ask any question for streaming grounded answer")
     print("  • Type 'exit' or 'quit' to end")
     print("=" * 65)
 
     history = []
     last_context = ""
-    current_mode = os.environ.get("DEFAULT_CONSOLE_MODE", "ai")
     if current_mode == "instant":
-        print("⚡ Active Mode: Instant (<100ms database responses)")
+        if not has_ai:
+            print("💡 Notice: Local AI (Ollama) is offline or not installed.")
+        print("⚡ Active Mode: Instant (<100ms database responses - zero AI wait)")
     else:
         print(f"🤖 Active Mode: AI Grounded ({LLM_MODEL} streaming summaries)")
 
@@ -590,8 +845,13 @@ def run_console():
                 continue
 
             if user_input.lower() in ("/ai", "/deep", "/mode ai"):
-                current_mode = "ai"
-                print(f"🤖 AI Summary Mode activated! Generates streaming grounded summaries via {LLM_MODEL}.")
+                if not ensure_ollama_running():
+                    print(f"⚠️ Local Ollama is offline or not installed.")
+                    print(f"👉 To enable AI summaries: install Ollama (https://ollama.com) and run: `ollama pull {LLM_MODEL}`")
+                    print("⚡ Remaining in Instant Mode (<100ms database queries).")
+                else:
+                    current_mode = "ai"
+                    print(f"🤖 AI Summary Mode activated! Generates streaming grounded summaries via {LLM_MODEL}.")
                 continue
 
             # 1. Project ID exact match (e.g. 24HH0043, 22HF0008, 25H00064)

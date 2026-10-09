@@ -21,14 +21,18 @@ from .query_graph import (
     print_matched_projects_list,
     print_instant_insights,
     print_fts_results,
+    ensure_ollama_running,
+    search_projects_by_location,
 )
 
 __all__ = [
     "run_scraper",
     "sync_projects_to_neo4j",
     "run_console",
+    "ensure_ollama_running",
     "ask_llm_stream",
     "search_project_by_id",
+    "search_projects_by_location",
     "search_graph_fts",
     "get_top_contractors",
     "get_top_projects",
