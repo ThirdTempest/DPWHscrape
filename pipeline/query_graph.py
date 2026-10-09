@@ -87,6 +87,16 @@ INFRA_DOMAIN_KEYWORDS = {
     "civil", "works", "engineering", "asphalt", "concrete", "paving", "rehabilitation"
 }
 
+CEBU_MUNICIPALITIES = {
+    "cebu", "mandaue", "lapu", "talisay", "toledo", "bogo", "naga", "carcar",
+    "danao", "minglanilla", "consolacion", "cordova", "compostela", "liloan", "san fernando",
+    "balamban", "asturias", "tuburan", "pinamungajan", "aloguinsan", "barili", "dumanjug",
+    "ronda", "alcantara", "moalboal", "badian", "alegria", "malabuyoc", "ginatilan", "samboan",
+    "santander", "oslob", "boljoon", "alcoy", "dalaguete", "argao", "sibonga", "san remigio",
+    "medellin", "daanbantayan", "madridejos", "bantayan", "santa fe", "tabogon", "tabuelan",
+    "borbon", "sogod", "catmon", "carmen", "camotes", "pilar", "poro", "san francisco", "tudela"
+}
+
 
 def is_off_topic_query(query: str) -> tuple[bool, str]:
     """Pre-retrieval intent classifier: intercepts programming, code generation, generic trivia, and off-domain definitions in <1ms."""
@@ -546,8 +556,36 @@ def is_prohibited_stream_chunk(text: str) -> bool:
     ))
 
 
+def is_local_llm() -> bool:
+    """Detects whether LLM is running locally (unlimited tokens, zero billing) vs remote cloud API (cost-sensitive)."""
+    base = LLM_BASE_URL.lower()
+    local_hosts = ("localhost", "127.0.0.1", "0.0.0.0", "::1", "192.168.", "10.")
+    return any(h in base for h in local_hosts) or "localhost:11434" in base
+
+
+def get_effective_max_tokens(requested_tokens: int = 150) -> int:
+    """Situational Token Manager:
+    - Local AI (Ollama): Unlimited tokens (e.g. 768 tokens) to prevent cutoff and finish complete thoughts naturally.
+    - Cloud API (OpenAI/DeepSeek): Enforces strict token limit to conserve user API balance and credits.
+    """
+    env_cap = os.getenv("LLM_MAX_TOKENS")
+    if env_cap:
+        try:
+            return int(env_cap)
+        except ValueError:
+            pass
+
+    if is_local_llm():
+        # Local model is completely free and unlimited: give it plenty of room to finish complete sentences!
+        return max(requested_tokens, 768)
+    else:
+        # Remote cloud API: enforce conservative quota (e.g. 150 tokens) to save money
+        return min(requested_tokens, 150)
+
+
 async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
-    """Stream from local Ollama or OpenAI-compatible endpoint with real-time response timer and output guardrail."""
+    """Stream from local Ollama or OpenAI-compatible endpoint with real-time response timer and situational token management."""
+    effective_tokens = get_effective_max_tokens(max_tokens)
     url_native = "http://localhost:11434/api/chat"
     payload_native = {
         "model": LLM_MODEL,
@@ -555,8 +593,8 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
         "stream": True,
         "options": {
             "num_thread": 6,       # Optimal for 4-core / 8-thread AMD Ryzen CPU
-            "num_ctx": 512,        # Reduces prefill KV-cache latency by 75%
-            "num_predict": max_tokens,
+            "num_ctx": 2048 if is_local_llm() else 512,  # Full context window for local AI
+            "num_predict": effective_tokens,
             "temperature": 0.2,
             "repeat_penalty": 1.25
         }
@@ -631,7 +669,7 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
         "model": LLM_MODEL,
         "messages": messages,
         "stream": True,
-        "max_tokens": max_tokens,
+        "max_tokens": effective_tokens,
         "temperature": 0.1
     }
     start_time_v1 = time.perf_counter()
@@ -796,7 +834,8 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
             "3. NEVER use the phrase 'Barangay Unspecified'.\n"
             "4. Always output complete, grammatically finished sentences ending with terminal punctuation (. or !). Never stop mid-sentence."
         )
-        print(f"\n🤖 Grounded Engineering Summary ({LLM_MODEL}):")
+        engine_badge = "Local Engine - Unlimited Tokens" if is_local_llm() else "Cloud API - Quota Capped"
+        print(f"\n🤖 Grounded Engineering Summary ({LLM_MODEL} | {engine_badge}):")
         print("-" * 62)
         messages = [
             {"role": "system", "content": system_prompt},
@@ -817,7 +856,9 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
             total_in_db = loc_total_cnt
             total_b_val = loc_total_budget
             loc_label = search_query.title()
-            print_matched_projects_list(matched_projects, title=f"PROJECTS IN: {loc_label} ({total_in_db} Found in Graph | Showing Top {len(matched_projects)})")
+            is_geo = any(c in search_query.lower() for c in CEBU_MUNICIPALITIES)
+            prefix = "PROJECTS IN:" if is_geo else "PROJECTS MATCHING:"
+            print_matched_projects_list(matched_projects, title=f"{prefix} {loc_label} ({total_in_db} Found in Graph | Showing Top {len(matched_projects)})")
             insights = print_instant_insights(matched_projects, total_count=total_in_db, total_budget=total_b_val)
         else:
             # 3b. Fallback to full-text search across graph
@@ -880,16 +921,29 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
                     f"Sample Projects: {sample_lines}"
                 )
 
-                system_prompt = (
-                    "You are an expert DPWH civil engineering assistant in Cebu, Philippines.\n"
-                    f"Provide a concise 1-sentence plain-English summary of what the DPWH public works in Cebu relate to '{loc_label}'.\n\n"
-                    "CRITICAL RULES:\n"
-                    "1. NO DICTIONARY DEFINITIONS: NEVER provide academic, dictionary, or textbook definitions (e.g. do NOT define what 'science', 'math', or 'water' is in general).\n"
-                    f"2. INFRASTRUCTURE FOCUS: State specifically what the public works involve (e.g., 'In Cebu, projects relating to {loc_label} involve the construction of educational facilities and science high school buildings.').\n"
-                    "3. Output exactly ONE or TWO complete sentences. Do NOT output numbered lists, bullet points, or repeated project titles.\n"
-                    "4. Never say 'Barangay Unspecified'."
-                )
-                print(f"🤖 Grounded Answer ({LLM_MODEL}):")
+                if is_local_llm():
+                    system_prompt = (
+                        "You are an expert DPWH civil engineering assistant in Cebu, Philippines.\n"
+                        f"Provide a clear, cohesive plain-English synthesis of what the DPWH public works in Cebu accomplish regarding '{loc_label}'.\n\n"
+                        "CRITICAL RULES:\n"
+                        "1. NO DICTIONARY DEFINITIONS: NEVER provide textbook definitions.\n"
+                        f"2. INFRASTRUCTURE FOCUS: Synthesize the verified engineering activities (such as major river basins, flood mitigation structures, revetments, seawalls, or road upgrading) across the mentioned Cebu locations.\n"
+                        "3. NO MECHANICAL NUMBERED LISTS: Write a coherent, well-structured synthesis rather than mechanically enumerating project IDs.\n"
+                        "4. ALWAYS finish complete sentences. Never cut off mid-thought.\n"
+                        "5. Never say 'Barangay Unspecified'."
+                    )
+                else:
+                    system_prompt = (
+                        "You are an expert DPWH civil engineering assistant in Cebu, Philippines.\n"
+                        f"Provide a concise 1 to 2 sentence summary of what the DPWH public works in Cebu relate to '{loc_label}'.\n\n"
+                        "CRITICAL RULES:\n"
+                        "1. NO DICTIONARY DEFINITIONS: Focus solely on public works in Cebu.\n"
+                        "2. Be concise (1-2 sentences) to conserve API tokens. Never stop mid-sentence.\n"
+                        "3. Never say 'Barangay Unspecified'."
+                    )
+
+                engine_badge = "Local Engine - Unlimited Tokens" if is_local_llm() else "Cloud API - Quota Capped"
+                print(f"🤖 Grounded Answer ({LLM_MODEL} | {engine_badge}):")
                 print("-" * 62)
 
                 messages = [
@@ -899,12 +953,12 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
                         "content": (
                             f"Knowledge Graph Context:\n{graph_context}\n\n"
                             f"Topic: {loc_label}\n"
-                            f"Task: Based strictly on the context above, what do the DPWH Cebu projects matching '{loc_label}' involve? "
-                            f"(Do not define '{loc_label}', focus solely on the public works projects)."
+                            f"Task: Based strictly on the context above, synthesize what the DPWH Cebu projects matching '{loc_label}' involve. "
+                            f"(Do not define '{loc_label}', focus solely on the public works projects in Cebu)."
                         )
                     }
                 ]
-                answer_text = await stream_ollama(messages, max_tokens=120)
+                answer_text = await stream_ollama(messages, max_tokens=150)
                 print("💡 Tip: Type any Project ID (e.g. '25HN0012') or ask 'tell me more about [ID]' for full engineering details.")
                 return answer_text, graph_context
 
