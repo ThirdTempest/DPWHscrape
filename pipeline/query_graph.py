@@ -124,19 +124,24 @@ def is_off_topic_query(query: str) -> tuple[bool, str]:
     if is_creative:
         return True, "General trivia and creative writing queries are outside system scope."
 
-    # 5. Non-domain generic definition queries (e.g. "what is science?", "what is physics?", "what is love?")
-    # Only block if NO domain keywords (like cebu, project, school, building, road, contractor) are present
-    is_generic_def = bool(re.search(
-        r'\b(?:what\s+is|what\s+are|define|explain)\s+(?:science|physics|chemistry|biology|philosophy|math|mathematics|ai|artificial\s+intelligence|machine\s+learning|love|life|gravity|photosynthesis|democracy|capitalism)\b',
+    # 5. Non-domain generic definition queries (e.g. "what is dictionary?", "what is science?", "define X")
+    def_match = re.search(r'^(?:what\s+(?:is|are|was|were)|define|explain|meaning\s+of)\s+(?:an?\s+|the\s+)?([a-zA-Z0-9_\s]+?)\??$', q_lower)
+    if def_match:
+        target = def_match.group(1).strip()
+        target_words = set(target.split())
+        has_domain = bool(target_words & INFRA_DOMAIN_KEYWORDS) or bool(re.search(r'\b\d{2}[A-Za-z]{1,2}\d{4,5}\b', target))
+        if not has_domain:
+            return True, f"Generic concept definitions outside DPWH civil engineering ('{target}') are outside system scope."
+
+    # 6. Persona adoption, roleplay, or system instruction overrides (e.g. "act as a teacher")
+    is_persona_override = bool(re.search(
+        r'\b(?:act\s+as\s+(?:a|an)|you\s+are\s+now\s+(?:a|an)|pretend\s+to\s+be|'
+        r'ignore\s+(?:all\s+)?(?:previous\s+)?instructions|jailbreak|dan\s+mode|'
+        r'bypass\s+(?:rules|filters))\b',
         q_lower
     ))
-    if is_generic_def:
-        has_domain_hint = any(kw in q_lower for kw in [
-            "cebu", "dpwh", "project", "projects", "school", "high school", "building",
-            "facility", "contractor", "budget", "cost", "location", "status", "road", "bridge"
-        ])
-        if not has_domain_hint:
-            return True, "Generic concept definitions outside DPWH civil engineering are outside system scope."
+    if is_persona_override:
+        return True, "Persona adoption and roleplaying prompts are outside system scope."
 
     return False, ""
 
@@ -729,7 +734,7 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
         print("   • 'Any projects in Bogo?'")
         print("   • 'Who is the top contractor in Cebu?'")
         print("   • 'Tell me about project 24HH0043'")
-        return "", ""
+        return "", last_context
 
     print("🔍 Fetching knowledge graph facts from Neo4j (<20ms)...")
 
@@ -914,7 +919,7 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
                         valid_records.append(r)
                 matched_records = valid_records
 
-            if not matched_records and not last_context:
+            if not matched_records and not (is_followup and last_context):
                 q_lower = question.lower()
                 q_words = set(re.findall(r'[a-zA-Z0-9]+', q_lower))
                 is_domain_query = bool(q_words & INFRA_DOMAIN_KEYWORDS)
@@ -926,11 +931,11 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
                     print("   • 'Any projects in Bogo?'")
                     print("   • 'Who is the top contractor in Cebu?'")
                     print("   • 'Tell me about project 24HH0043'")
-                    return "", ""
+                    return "", last_context
                 else:
                     print(f"\n⚠️ No records found in the DPWH Cebu database matching '{search_query}'.")
                     print("💡 Try searching by City/Municipality (e.g., 'Toledo', 'Mandaue') or Project ID (e.g., '24HH0043').")
-                    return "", ""
+                    return "", last_context
 
             # General Question with matched graph facts or ongoing context
             if matched_records:
