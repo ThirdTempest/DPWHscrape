@@ -484,7 +484,8 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
             "num_thread": 6,       # Optimal for 4-core / 8-thread AMD Ryzen CPU
             "num_ctx": 512,        # Reduces prefill KV-cache latency by 75%
             "num_predict": max_tokens,
-            "temperature": 0.1
+            "temperature": 0.2,
+            "repeat_penalty": 1.25
         }
     }
     
@@ -739,17 +740,29 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
 
                 system_prompt = (
                     "You are an expert DPWH civil engineering assistant in Cebu, Philippines.\n"
-                    "Summarize primary public works in 1 to 2 complete sentences based ONLY on the context. Do NOT list project numbers one by one.\n"
-                    "Never say 'Barangay Unspecified'."
+                    f"Provide a concise 1-sentence plain-English summary of what the DPWH public works in Cebu relate to '{loc_label}'.\n\n"
+                    "CRITICAL RULES:\n"
+                    "1. NO DICTIONARY DEFINITIONS: NEVER provide academic, dictionary, or textbook definitions (e.g. do NOT define what 'science', 'math', or 'water' is in general).\n"
+                    f"2. INFRASTRUCTURE FOCUS: State specifically what the public works involve (e.g., 'In Cebu, projects relating to {loc_label} involve the construction of educational facilities and science high school buildings.').\n"
+                    "3. Output exactly ONE or TWO complete sentences. Do NOT output numbered lists, bullet points, or repeated project titles.\n"
+                    "4. Never say 'Barangay Unspecified'."
                 )
                 print(f"🤖 Grounded Answer ({LLM_MODEL}):")
                 print("-" * 62)
 
                 messages = [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Knowledge Graph Context:\n{graph_context}\n\nUser Question: {question}"}
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Knowledge Graph Context:\n{graph_context}\n\n"
+                            f"Topic: {loc_label}\n"
+                            f"Task: Based strictly on the context above, what do the DPWH Cebu projects matching '{loc_label}' involve? "
+                            f"(Do not define '{loc_label}', focus solely on the public works projects)."
+                        )
+                    }
                 ]
-                answer_text = await stream_ollama(messages, max_tokens=90)
+                answer_text = await stream_ollama(messages, max_tokens=120)
                 print("💡 Tip: Type any Project ID (e.g. '25HN0012') or ask 'tell me more about [ID]' for full engineering details.")
                 return answer_text, graph_context
 
