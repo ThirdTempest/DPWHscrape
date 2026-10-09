@@ -88,6 +88,60 @@ INFRA_DOMAIN_KEYWORDS = {
 }
 
 
+def is_off_topic_query(query: str) -> tuple[bool, str]:
+    """Pre-retrieval intent classifier: intercepts programming, code generation, generic trivia, and off-domain definitions in <1ms."""
+    q_lower = query.lower().strip()
+
+    # 1. Direct Project ID exemption (e.g. "24HH0043", "what is 24HH0043?")
+    if re.search(r'\b\d{2}[A-Za-z]{1,2}\d{4,5}\b', query):
+        return False, ""
+
+    # 2. Exempt legitimate DPWH infrastructure code queries (e.g. "contractor code", "project code", "contractor 7494")
+    is_domain_code = bool(re.search(r'\b(?:contractor|project|office|procurement|district|dpwh)\s+code\b', q_lower))
+    if is_domain_code:
+        return False, ""
+
+    # 3. Programming, scripting, or coding query intent
+    is_code_request = bool(re.search(
+        r'\b(?:for\s+loops?|while\s+loops?|nested\s+loops?|'
+        r'write\s+(?:a\s+)?(?:code|script|program|function|class)|'
+        r'code\s+(?:for|to|in|example|snippet|sample)|'
+        r'python|javascript|typescript|c\+\+|golang|rust|html|css|php|java\b|'
+        r'function|syntax|algorithm|compiler|debugging|recursion|sql\s+query|'
+        r'def\s+\w+|import\s+\w+|console\.log|print\()\b',
+        q_lower
+    ))
+    if is_code_request:
+        return True, "Programming and software code generation queries are outside system scope."
+
+    # 4. Creative writing, recipes, general chat trivia
+    is_creative = bool(re.search(
+        r'\b(?:write\s+(?:a\s+)?(?:poem|poetry|story|essay|song|joke)|'
+        r'tell\s+me\s+a\s+joke|weather\s+in|recipe\s+for|capital\s+of|'
+        r'who\s+won|translate\s+(?:to|into)|how\s+to\s+cook)\b',
+        q_lower
+    ))
+    if is_creative:
+        return True, "General trivia and creative writing queries are outside system scope."
+
+    # 5. Non-domain generic definition queries (e.g. "what is science?", "what is physics?", "what is love?")
+    # Only block if NO domain keywords (like cebu, project, school, building, road, contractor) are present
+    is_generic_def = bool(re.search(
+        r'\b(?:what\s+is|what\s+are|define|explain)\s+(?:science|physics|chemistry|biology|philosophy|math|mathematics|ai|artificial\s+intelligence|machine\s+learning|love|life|gravity|photosynthesis|democracy|capitalism)\b',
+        q_lower
+    ))
+    if is_generic_def:
+        has_domain_hint = any(kw in q_lower for kw in [
+            "cebu", "dpwh", "project", "projects", "school", "high school", "building",
+            "facility", "contractor", "budget", "cost", "location", "status", "road", "bridge"
+        ])
+        if not has_domain_hint:
+            return True, "Generic concept definitions outside DPWH civil engineering are outside system scope."
+
+    return False, ""
+
+
+
 # ==========================================================
 # 1. Instant Neo4j Graph Queries (< 50ms)
 # ==========================================================
@@ -200,7 +254,7 @@ def search_graph_fts(query: str, limit: int = 5) -> list[dict]:
         return []
 
     words = clean.split()
-    search_term = " OR ".join([f"{w}*" for w in words if len(w) > 1]) or clean
+    search_term = " AND ".join([f"{w}*" for w in words if len(w) > 1]) or clean
     cypher = """
     CALL db.index.fulltext.queryNodes('entity_fts', $search_term) YIELD node, score
     WITH node, score
@@ -228,13 +282,15 @@ def search_graph_fts(query: str, limit: int = 5) -> list[dict]:
         except Exception:
             pass
 
-        # Fallback to case-insensitive CONTAINS across multiple fields
+        # Fallback to case-insensitive CONTAINS requiring ALL search terms across fields
         fallback = """
         MATCH (node)
-        WHERE toLower(node.entity_id) CONTAINS toLower($q)
-           OR toLower(node.description) CONTAINS toLower($q)
-           OR toLower(coalesce(node.location, '')) CONTAINS toLower($q)
-           OR toLower(coalesce(node.contractor, '')) CONTAINS toLower($q)
+        WHERE ALL(w IN $words WHERE
+            toLower(node.entity_id) CONTAINS toLower(w)
+            OR toLower(coalesce(node.description, '')) CONTAINS toLower(w)
+            OR toLower(coalesce(node.location, '')) CONTAINS toLower(w)
+            OR toLower(coalesce(node.contractor, '')) CONTAINS toLower(w)
+        )
         WITH node
         LIMIT $limit
         OPTIONAL MATCH (node)-[r]-(neighbor)
@@ -251,8 +307,7 @@ def search_graph_fts(query: str, limit: int = 5) -> list[dict]:
                    desc: r.description
                })[0..6] AS relations
         """
-        first_word = words[0] if words else clean
-        return s.run(fallback, q=first_word, limit=limit).data()
+        return s.run(fallback, words=words, limit=limit).data()
 
 def get_top_contractors(limit: int = 10) -> list[dict]:
     """Analytics: Top contractors by total awarded budget."""
@@ -473,8 +528,21 @@ def ensure_ollama_running() -> bool:
     return False
 
 
+def is_prohibited_stream_chunk(text: str) -> bool:
+    """Post-generation output rail: detects programming code or generic conceptual definitions."""
+    t = text.lower()
+    return bool(re.search(
+        r'(?:```(?:python|javascript|js|ts|cpp|java|go|html|css)?|'
+        r'\b(?:for\s+[a-zA-Z_]\w*\s+in\s+|while\s*\(|let\s+\w+\s*=|const\s+\w+\s*=|'
+        r'def\s+[a-zA-Z_]\w*\(|function\s+[a-zA-Z_]\w*\(|console\.log|'
+        r'System\.out\.println|printf\(|#include\s+<)|'
+        r'is\s+a\s+programming\s+construct|is\s+a\s+looping\s+construct)\b',
+        t
+    ))
+
+
 async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
-    """Stream from local Ollama or OpenAI-compatible endpoint with real-time response timer."""
+    """Stream from local Ollama or OpenAI-compatible endpoint with real-time response timer and output guardrail."""
     url_native = "http://localhost:11434/api/chat"
     payload_native = {
         "model": LLM_MODEL,
@@ -498,6 +566,9 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
             async with client.stream("POST", url_native, json=payload_native) as resp:
                 if resp.status_code == 200:
+                    buffer = ""
+                    flushed = False
+                    suppressed = False
                     async for line in resp.aiter_lines():
                         if not line:
                             continue
@@ -508,11 +579,37 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
                             if first_token_time is None:
                                 first_token_time = time.perf_counter()
                             token_count += 1
-                            sys.stdout.write(chunk)
-                            sys.stdout.flush()
                             collected_chunks.append(chunk)
+                            buffer += chunk
+                            if not flushed:
+                                if is_prohibited_stream_chunk(buffer):
+                                    suppressed = True
+                                    break
+                                if len(buffer) >= 30:
+                                    sys.stdout.write(buffer)
+                                    sys.stdout.flush()
+                                    flushed = True
+                            else:
+                                if is_prohibited_stream_chunk("".join(collected_chunks)):
+                                    suppressed = True
+                                    break
+                                sys.stdout.write(chunk)
+                                sys.stdout.flush()
                         if d.get("done"):
                             break
+                    if suppressed:
+                        print("\n⚠️ [Response Suppressed by Guardrail: Detected off-domain output]")
+                        print("💡 This assistant is strictly restricted to DPWH Cebu infrastructure projects.")
+                        print("=" * 62)
+                        return "I am restricted to answering questions regarding DPWH Cebu infrastructure projects."
+                    if not flushed and buffer:
+                        if is_prohibited_stream_chunk(buffer):
+                            print("\n⚠️ [Response Suppressed by Guardrail: Detected off-domain output]")
+                            print("💡 This assistant is strictly restricted to DPWH Cebu infrastructure projects.")
+                            print("=" * 62)
+                            return "I am restricted to answering questions regarding DPWH Cebu infrastructure projects."
+                        sys.stdout.write(buffer)
+                        sys.stdout.flush()
                     elapsed = time.perf_counter() - start_time
                     ttft = (first_token_time - start_time) if first_token_time else elapsed
                     gen_duration = elapsed - ttft
@@ -539,6 +636,9 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
             async with client.stream("POST", url_v1, json=payload_v1) as resp:
+                buffer_v1 = ""
+                flushed_v1 = False
+                suppressed_v1 = False
                 async for line in resp.aiter_lines():
                     if line.startswith("data: ") and not line.endswith("[DONE]"):
                         import json
@@ -549,11 +649,37 @@ async def stream_ollama(messages: list[dict], max_tokens: int = 50) -> str:
                                 if first_token_time_v1 is None:
                                     first_token_time_v1 = time.perf_counter()
                                 token_count_v1 += 1
-                                sys.stdout.write(chunk)
-                                sys.stdout.flush()
                                 collected_chunks.append(chunk)
+                                buffer_v1 += chunk
+                                if not flushed_v1:
+                                    if is_prohibited_stream_chunk(buffer_v1):
+                                        suppressed_v1 = True
+                                        break
+                                    if len(buffer_v1) >= 30:
+                                        sys.stdout.write(buffer_v1)
+                                        sys.stdout.flush()
+                                        flushed_v1 = True
+                                else:
+                                    if is_prohibited_stream_chunk("".join(collected_chunks)):
+                                        suppressed_v1 = True
+                                        break
+                                    sys.stdout.write(chunk)
+                                    sys.stdout.flush()
                         except Exception:
                             pass
+                if suppressed_v1:
+                    print("\n⚠️ [Response Suppressed by Guardrail: Detected off-domain output]")
+                    print("💡 This assistant is strictly restricted to DPWH Cebu infrastructure projects.")
+                    print("=" * 62)
+                    return "I am restricted to answering questions regarding DPWH Cebu infrastructure projects."
+                if not flushed_v1 and buffer_v1:
+                    if is_prohibited_stream_chunk(buffer_v1):
+                        print("\n⚠️ [Response Suppressed by Guardrail: Detected off-domain output]")
+                        print("💡 This assistant is strictly restricted to DPWH Cebu infrastructure projects.")
+                        print("=" * 62)
+                        return "I am restricted to answering questions regarding DPWH Cebu infrastructure projects."
+                    sys.stdout.write(buffer_v1)
+                    sys.stdout.flush()
         elapsed = time.perf_counter() - start_time_v1
         ttft = (first_token_time_v1 - start_time_v1) if first_token_time_v1 else elapsed
         gen_duration = elapsed - ttft
@@ -593,6 +719,17 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
     """Retrieve relevant subgraph from Neo4j in <20ms and stream grounded answer from Ollama with conversational memory."""
     if history is None:
         history = []
+
+    # 0. Pre-retrieval intent gate: intercept off-domain queries immediately (<1ms)
+    off_topic, reason = is_off_topic_query(question)
+    if off_topic:
+        print(f"\n⚠️ Out of Scope: {reason}")
+        print("💡 This assistant is strictly restricted to DPWH Cebu infrastructure projects, contractors, budgets, and locations.")
+        print("   Example queries:")
+        print("   • 'Any projects in Bogo?'")
+        print("   • 'Who is the top contractor in Cebu?'")
+        print("   • 'Tell me about project 24HH0043'")
+        return "", ""
 
     print("🔍 Fetching knowledge graph facts from Neo4j (<20ms)...")
 
@@ -767,6 +904,16 @@ async def ask_llm_stream(question: str, history: list[dict] = None, last_context
                 return answer_text, graph_context
 
         else:
+            # Post-retrieval validation: Ensure matched non-project records have genuine term overlap
+            if matched_records:
+                query_tokens = [w.lower() for w in terms]
+                valid_records = []
+                for r in matched_records:
+                    ent_str = f"{r.get('entity', '')} {r.get('description', '')}".lower()
+                    if any(t in ent_str for t in query_tokens):
+                        valid_records.append(r)
+                matched_records = valid_records
+
             if not matched_records and not last_context:
                 q_lower = question.lower()
                 q_words = set(re.findall(r'[a-zA-Z0-9]+', q_lower))
